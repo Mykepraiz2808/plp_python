@@ -1,0 +1,144 @@
+R script that replicates further analysis
+
+# Create an R script that replicates the analysis and is adaptable for further exploration.
+r_code = r'''
+# Load packages
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+
+# -------- CONFIG --------
+excel_path <- "Data to Dr Saka of 3 Stations.xlsx"   # put the file in the working directory
+response_name <- "TAV"   # change to "TMED" if TAV is empty
+n_levels_to_use <- c(0, 100)  # "first and second levels" of N-LEVEL
+
+# --------- LOAD & TIDY (matches Python steps) ---------
+raw <- readxl::read_excel(excel_path, sheet = "Sheet1", col_names = FALSE)
+
+header_row <- 5  # 1-indexed row number where headers are; Python used index 4 (0-based)
+start_cols <- c(2, 18, 34) # 1-indexed start columns for 3 stations
+
+make_unique <- function(x){
+  seen <- list()
+  out <- character(length(x))
+  for (i in seq_along(x)){
+    key <- as.character(x[i])
+    if (is.null(seen[[key]])){
+      seen[[key]] <- 0
+      out[i] <- key
+    } else {
+      seen[[key]] <- seen[[key]] + 1
+      out[i] <- paste0(key, "_", seen[[key]])
+    }
+  }
+  out
+}
+
+extract_block <- function(start_col){
+  # Read headers until first NA cell to the right
+  headers <- c()
+  c <- start_col
+  while (c <= ncol(raw)){
+    val <- raw[[header_row, c]]
+    if (is.na(val)) break
+    headers <- c(headers, as.character(val))
+    c <- c + 1
+  }
+  cols <- start_col:(c-1)
+  dfb <- raw[(header_row):(nrow(raw)), cols, drop = FALSE]
+  colnames(dfb) <- make_unique(headers)
+  dfb <- dfb[-1, , drop = FALSE]  # drop header row copy
+  # types
+  if ("DATE" %in% names(dfb)) {
+    dfb$DATE <- suppressWarnings(as.POSIXct(as.numeric(dfb$DATE), origin = "1970-01-01", tz = "UTC"))
+  }
+  num_cols <- setdiff(names(dfb), c("N-LEVEL","DATE"))
+  dfb[num_cols] <- lapply(dfb[num_cols], function(x) suppressWarnings(as.numeric(x)))
+  dfb <- dfb[!is.na(dfb$DATE), , drop = FALSE]
+  dfb
+}
+
+blocks <- lapply(start_cols, extract_block)
+for (i in seq_along(blocks)) {
+  blocks[[i]]$Station <- paste0("Station", i)
+}
+
+keep_cols <- c("N-LEVEL","DATE","SRAD","TMAX","TMIN","RAIN","DEWP","WIND","RHUM","TMED","TAV","Station")
+tidy <- dplyr::bind_rows(lapply(blocks, function(b) b[, intersect(keep_cols, names(b)), drop = FALSE])) %>%
+  mutate(N = suppressWarnings(as.numeric(`N-LEVEL`)))
+
+# Choose response
+if (!("TAV" %in% names(tidy)) || all(is.na(tidy$TAV))) {
+  response_name <- "TMED"
+}
+
+tidy <- tidy %>% filter(!is.na(N), !is.na(.data[[response_name]]))
+
+# Select first two N levels
+levels_sorted <- sort(unique(tidy$N))
+two_levels <- intersect(n_levels_to_use, levels_sorted)
+if (length(two_levels) < 2) two_levels <- head(levels_sorted, 2)
+
+subset <- tidy %>% filter(N %in% two_levels)
+
+# ---------- FULL FACTORIAL: Station (1 vs 2) x N (first vs second) ----------
+subset12 <- subset %>% filter(Station %in% c("Station1","Station2")) %>%
+  mutate(N_fac = factor(N), Station = factor(Station))
+
+# ANOVA
+full_fit <- lm(reformulate(termlabels = c("N_fac","Station","N_fac:Station"), response = response_name), data = subset12)
+full_anova <- anova(full_fit)
+write.csv(full_anova, "R_full_factorial_anova.csv", row.names = TRUE)
+
+# Cell means and effects
+cell_means <- subset12 %>%
+  group_by(N_fac, Station) %>%
+  summarise(mean_y = mean(.data[[response_name]], na.rm = TRUE), .groups = "drop")
+write.csv(cell_means, "R_full_factorial_cell_means.csv", row.names = FALSE)
+
+# Plots
+png("R_main_effect_N.png")
+with(subset12, tapply(.data[[response_name]], N_fac, mean, na.rm = TRUE)) %>%
+  plot(type = "o", xlab = "N Level", ylab = paste("Mean", response_name), main = "Main Effect of N")
+dev.off()
+
+png("R_main_effect_Station.png")
+with(subset12, tapply(.data[[response_name]], Station, mean, na.rm = TRUE)) %>%
+  plot(type = "o", xlab = "Station", ylab = paste("Mean", response_name), main = "Main Effect of Station")
+dev.off()
+
+# ---------- FRACTIONAL FACTORIAL (2^(3-1)) with generator C = A*B ----------
+# A = N (two-level), B = Station (1 vs 2), C = SRAD bin (low/high by station)
+subset12$SRAD <- as.numeric(subset12$SRAD)
+subset12 <- subset12 %>% group_by(Station) %>% mutate(SRAD_bin = as.integer(SRAD > median(SRAD, na.rm = TRUE))) %>% ungroup()
+subset12$A <- ifelse(subset12$N == two_levels[1], -1, +1)
+subset12$B <- ifelse(subset12$Station == "Station1", -1, +1)
+subset12$C <- ifelse(subset12$SRAD_bin == 1, +1, -1)
+
+frac <- subset12 %>% filter(C == A*B)
+
+# Fit aliased main-effects model
+frac$N_fac <- factor(frac$N)
+frac$C_fac <- factor(ifelse(frac$C == 1, "HighSRAD", "LowSRAD"))
+frac_fit <- lm(reformulate(termlabels = c("N_fac","Station","C_fac"), response = response_name), data = frac)
+frac_anova <- anova(frac_fit)
+write.csv(frac_anova, "R_fractional_factorial_anova.csv", row.names = TRUE)
+
+# Cell means
+frac_cell_means <- frac %>% group_by(N_fac, Station, C_fac) %>%
+  summarise(mean_y = mean(.data[[response_name]], na.rm = TRUE), .groups="drop")
+write.csv(frac_cell_means, "R_fractional_cell_means.csv", row.names = FALSE)
+
+# Notes:
+# - You can change `response_name` to analyze a different response.
+# - To use other stations or define a different third factor for the fractional design,
+#   modify the construction of `C_fac` accordingly.
+'''
+r_path = "/mnt/data/factorial_analysis.R"
+with open(r_path, "w") as f:
+    f.write(r_code)
+
+r_path
